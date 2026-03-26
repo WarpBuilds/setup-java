@@ -92,7 +92,13 @@ export function isGhes(): boolean {
   const ghUrl = new URL(
     process.env['GITHUB_SERVER_URL'] || 'https://github.com'
   );
-  return ghUrl.hostname.toUpperCase() !== 'GITHUB.COM';
+
+  const hostname = ghUrl.hostname.trimEnd().toUpperCase();
+  const isGitHubHost = hostname === 'GITHUB.COM';
+  const isGitHubEnterpriseCloudHost = hostname.endsWith('.GHE.COM');
+  const isLocalHost = hostname.endsWith('.LOCALHOST');
+
+  return !isGitHubHost && !isGitHubEnterpriseCloudHost && !isLocalHost;
 }
 
 export function isCacheFeatureAvailable(): boolean {
@@ -127,21 +133,25 @@ export function getVersionFromFileContent(
   const versionFileName = getFileName(versionFile);
   if (versionFileName == '.tool-versions') {
     javaVersionRegExp =
-      /^(java\s+)(?:\S*-)?v?(?<version>(\d+)(\.\d+)?(\.\d+)?(\+\d+)?(-ea(\.\d+)?)?)$/m;
+      /^java\s+(?:\S*-)?(?<version>\d+(?:\.\d+)*([+_.-](?:openj9[-._]?\d[\w.-]*|java\d+|jre[-_\w]*|OpenJDK\d+[\w_.-]*|[a-z0-9]+))*)/im;
+  } else if (versionFileName == '.sdkmanrc') {
+    javaVersionRegExp = /^java\s*=\s*(?<version>[^-]+)/m;
   } else {
     javaVersionRegExp = /(?<version>(?<=(^|\s|-))(\d+\S*))(\s|$)/;
   }
 
-  const fileContent = content.match(javaVersionRegExp)?.groups?.version
+  const capturedVersion = content.match(javaVersionRegExp)?.groups?.version
     ? (content.match(javaVersionRegExp)?.groups?.version as string)
     : '';
-  if (!fileContent) {
+
+  core.debug(
+    `Parsed version '${capturedVersion}' from file '${versionFileName}'`
+  );
+  if (!capturedVersion) {
     return null;
   }
 
-  core.debug(`Version from file '${fileContent}'`);
-
-  const tentativeVersion = avoidOldNotation(fileContent);
+  const tentativeVersion = avoidOldNotation(capturedVersion);
   const rawVersion = tentativeVersion.split('-')[0];
 
   let version = semver.validRange(rawVersion)
@@ -178,8 +188,8 @@ export function convertVersionToSemver(version: number[] | string) {
 }
 
 export function getGitHubHttpHeaders(): OutgoingHttpHeaders {
-  const token = core.getInput('token');
-  const auth = !token ? undefined : `token ${token}`;
+  const resolvedToken = core.getInput('token') || process.env.GITHUB_TOKEN;
+  const auth = !resolvedToken ? undefined : `token ${resolvedToken}`;
 
   const headers: OutgoingHttpHeaders = {
     accept: 'application/vnd.github.VERSION.raw'
@@ -189,4 +199,15 @@ export function getGitHubHttpHeaders(): OutgoingHttpHeaders {
     headers.authorization = auth;
   }
   return headers;
+}
+
+// Rename archive to add extension because after downloading
+// archive does not contain extension type and it leads to some issues
+// on Windows runners without PowerShell Core.
+//
+// For default PowerShell Windows it should contain extension type to unpack it.
+export function renameWinArchive(javaArchivePath: string): string {
+  const javaArchivePathRenamed = `${javaArchivePath}.zip`;
+  fs.renameSync(javaArchivePath, javaArchivePathRenamed);
+  return javaArchivePathRenamed;
 }

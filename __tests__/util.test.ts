@@ -1,9 +1,13 @@
 import * as cache from '@actions/cache';
 import * as core from '@actions/core';
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   convertVersionToSemver,
+  getVersionFromFileContent,
   isVersionSatisfies,
-  isCacheFeatureAvailable
+  isCacheFeatureAvailable,
+  isGhes
 } from '../src/util';
 
 jest.mock('@actions/cache');
@@ -78,5 +82,80 @@ describe('convertVersionToSemver', () => {
   ])('%s -> %s', (input: string, expected: string) => {
     const actual = convertVersionToSemver(input);
     expect(actual).toBe(expected);
+  });
+});
+
+describe('getVersionFromFileContent', () => {
+  describe('.sdkmanrc', () => {
+    it.each([
+      ['java=11.0.20.1-tem', '11.0.20'],
+      ['java = 11.0.20.1-tem', '11.0.20'],
+      ['java=11.0.20.1-tem # a comment in sdkmanrc', '11.0.20'],
+      ['java=11.0.20.1-tem\n#java=21.0.20.1-tem\n', '11.0.20'], // choose first match
+      ['java=11.0.20.1-tem\njava=21.0.20.1-tem\n', '11.0.20'], // choose first match
+      ['#java=11.0.20.1-tem\njava=21.0.20.1-tem\n', '21.0.20'] // first one is 'commented' in .sdkmanrc
+    ])('parsing %s should return %s', (content: string, expected: string) => {
+      const actual = getVersionFromFileContent(content, 'openjdk', '.sdkmanrc');
+      expect(actual).toBe(expected);
+    });
+
+    describe('known versions', () => {
+      const csv = fs.readFileSync(
+        path.join(__dirname, 'data/sdkman-java-versions.csv'),
+        'utf8'
+      );
+      const versions = csv.split('\n').map(r => r.split(', '));
+
+      it.each(versions)(
+        'parsing %s should return %s',
+        (sdkmanJavaVersion: string, expected: string) => {
+          const asContent = `java=${sdkmanJavaVersion}`;
+          const actual = getVersionFromFileContent(
+            asContent,
+            'openjdk',
+            '.sdkmanrc'
+          );
+          expect(actual).toBe(expected);
+        }
+      );
+    });
+  });
+});
+
+describe('isGhes', () => {
+  const pristineEnv = process.env;
+
+  beforeEach(() => {
+    jest.resetModules();
+    process.env = {...pristineEnv};
+  });
+
+  afterAll(() => {
+    process.env = pristineEnv;
+  });
+
+  it('returns false when the GITHUB_SERVER_URL environment variable is not defined', async () => {
+    delete process.env['GITHUB_SERVER_URL'];
+    expect(isGhes()).toBeFalsy();
+  });
+
+  it('returns false when the GITHUB_SERVER_URL environment variable is set to github.com', async () => {
+    process.env['GITHUB_SERVER_URL'] = 'https://github.com';
+    expect(isGhes()).toBeFalsy();
+  });
+
+  it('returns false when the GITHUB_SERVER_URL environment variable is set to a GitHub Enterprise Cloud-style URL', async () => {
+    process.env['GITHUB_SERVER_URL'] = 'https://contoso.ghe.com';
+    expect(isGhes()).toBeFalsy();
+  });
+
+  it('returns false when the GITHUB_SERVER_URL environment variable has a .localhost suffix', async () => {
+    process.env['GITHUB_SERVER_URL'] = 'https://mock-github.localhost';
+    expect(isGhes()).toBeFalsy();
+  });
+
+  it('returns true when the GITHUB_SERVER_URL environment variable is set to some other URL', async () => {
+    process.env['GITHUB_SERVER_URL'] = 'https://src.onpremise.fabrikam.com';
+    expect(isGhes()).toBeTruthy();
   });
 });
