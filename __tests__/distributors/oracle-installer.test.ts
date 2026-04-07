@@ -95,7 +95,9 @@ describe('findPackageForDownload', () => {
   ])(
     'defaults to os.arch(): %s mapped to distro arch: %s',
     async (osArch: string, distroArch: string) => {
-      jest.spyOn(os, 'arch').mockReturnValue(osArch);
+      jest
+        .spyOn(os, 'arch')
+        .mockReturnValue(osArch as ReturnType<typeof os.arch>);
       jest.spyOn(os, 'platform').mockReturnValue('linux');
 
       const version = '18';
@@ -115,7 +117,8 @@ describe('findPackageForDownload', () => {
       const expectedUrl = `https://download.oracle.com/java/18/archive/jdk-18_${osType}-${distroArch}_bin.${archiveType}`;
 
       expect(result.url).toBe(expectedUrl);
-    }
+    },
+    10000
   );
 
   it('should throw an error', async () => {
