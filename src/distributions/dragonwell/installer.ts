@@ -5,7 +5,7 @@ import semver from 'semver';
 import fs from 'fs';
 import path from 'path';
 
-import {JavaBase} from '../base-installer';
+import {JavaBase} from '../base-installer.js';
 import {
   convertVersionToSemver,
   extractJdkFile,
@@ -13,13 +13,13 @@ import {
   getGitHubHttpHeaders,
   isVersionSatisfies,
   renameWinArchive
-} from '../../util';
-import {IDragonwellVersions, IDragonwellAllVersions} from './models';
+} from '../../util.js';
+import {IDragonwellVersions, IDragonwellAllVersions} from './models.js';
 import {
   JavaDownloadRelease,
   JavaInstallerOptions,
   JavaInstallerResults
-} from '../base-models';
+} from '../base-models.js';
 
 export class DragonwellDistribution extends JavaBase {
   constructor(installerOptions: JavaInstallerOptions) {
@@ -46,14 +46,21 @@ export class DragonwellDistribution extends JavaBase {
       .map(item => {
         return {
           version: item.jdk_version,
-          url: item.download_link
+          url: item.download_link,
+          checksum: item.checksum
+            ? {
+                algorithm: 'sha256',
+                value: item.checksum
+              }
+            : undefined
         } as JavaDownloadRelease;
       });
 
     if (!matchedVersions.length) {
-      throw new Error(
-        `Couldn't find any satisfied version for the specified java-version: "${version}" and architecture: "${this.architecture}".`
+      const availableVersionStrings = availableVersions.map(
+        item => item.jdk_version
       );
+      throw this.createVersionNotFoundError(version, availableVersionStrings);
     }
 
     const resolvedVersion = matchedVersions[0];
@@ -101,7 +108,7 @@ export class DragonwellDistribution extends JavaBase {
     core.info(
       `Downloading Java ${javaRelease.version} (${this.distribution}) from ${javaRelease.url} ...`
     );
-    let javaArchivePath = await tc.downloadTool(javaRelease.url);
+    let javaArchivePath = await this.downloadAndVerify(javaRelease);
 
     core.info(`Extracting Java archive...`);
     const extension = getDownloadArchiveExtension();

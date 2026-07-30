@@ -1,13 +1,56 @@
-import {OracleDistribution} from '../../src/distributions/oracle/installer';
+import {
+  jest,
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  beforeAll,
+  afterAll
+} from '@jest/globals';
 import os from 'os';
-import * as core from '@actions/core';
-import {getDownloadArchiveExtension} from '../../src/util';
 import {HttpClient} from '@actions/http-client';
 
+// Mock @actions/core before importing source modules that depend on it
+jest.unstable_mockModule('@actions/core', () => ({
+  info: jest.fn(),
+  warning: jest.fn(),
+  debug: jest.fn(),
+  error: jest.fn(),
+  notice: jest.fn(),
+  setFailed: jest.fn(),
+  setOutput: jest.fn(),
+  getInput: jest.fn(),
+  getBooleanInput: jest.fn(),
+  getMultilineInput: jest.fn(),
+  addPath: jest.fn(),
+  exportVariable: jest.fn(),
+  saveState: jest.fn(),
+  getState: jest.fn(),
+  setSecret: jest.fn(),
+  isDebug: jest.fn(() => false),
+  startGroup: jest.fn(),
+  endGroup: jest.fn(),
+  group: jest.fn((_name: string, fn: () => Promise<unknown>) => fn()),
+  toPlatformPath: jest.fn((p: string) => p),
+  toWin32Path: jest.fn((p: string) => p),
+  toPosixPath: jest.fn((p: string) => p)
+}));
+
+// Dynamic imports after mocking
+const core = await import('@actions/core');
+const {OracleDistribution} =
+  await import('../../src/distributions/oracle/installer.js');
+const {getDownloadArchiveExtension} = await import('../../src/util.js');
+
 describe('findPackageForDownload', () => {
-  let distribution: OracleDistribution;
-  let spyDebug: jest.SpyInstance;
-  let spyHttpClient: jest.SpyInstance;
+  let distribution: InstanceType<typeof OracleDistribution>;
+  let spyDebug: any;
+  let spyHttpClient: any;
+  let spyHttpClientGet: any;
+  let spyCoreError: any;
+
+  const ORACLE_CHECKSUM = 'f'.repeat(64);
 
   beforeEach(() => {
     distribution = new OracleDistribution({
@@ -17,8 +60,20 @@ describe('findPackageForDownload', () => {
       checkLatest: false
     });
 
-    spyDebug = jest.spyOn(core, 'debug');
+    spyDebug = core.debug as jest.Mock;
     spyDebug.mockImplementation(() => {});
+
+    // Mock core.error to suppress error logs
+    spyCoreError = core.error as jest.Mock;
+    spyCoreError.mockImplementation(() => {});
+
+    // Every resolved release fetches its `${url}.sha256` sibling checksum;
+    // stub it so tests never reach the real network.
+    spyHttpClientGet = jest.spyOn(HttpClient.prototype, 'get');
+    spyHttpClientGet.mockResolvedValue({
+      message: {statusCode: 200},
+      readBody: async () => ORACLE_CHECKSUM
+    });
   });
 
   it.each([
@@ -89,6 +144,23 @@ describe('findPackageForDownload', () => {
     expect(result.url).toBe(url);
   });
 
+  it('fetches the authoritative sha256 checksum for the resolved archive', async () => {
+    spyHttpClient = jest.spyOn(HttpClient.prototype, 'head');
+    spyHttpClient.mockResolvedValue({message: {statusCode: 200}});
+
+    const result = await distribution['findPackageForDownload']('21');
+
+    jest.restoreAllMocks();
+
+    expect(result.checksum).toEqual({
+      algorithm: 'sha256',
+      value: ORACLE_CHECKSUM,
+      source: `${result.url}.sha256`
+    });
+    expect(spyHttpClientGet).toHaveBeenCalledWith(`${result.url}.sha256`);
+    expect(spyHttpClientGet).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ['amd64', 'x64'],
     ['arm64', 'aarch64']
@@ -127,6 +199,66 @@ describe('findPackageForDownload', () => {
     );
     await expect(distribution['findPackageForDownload']('11')).rejects.toThrow(
       /Oracle JDK is only supported for JDK 17 and later/
+    );
+  });
+});
+describe('findPackageForDownload with latest', () => {
+  let spyHttpClientHead: any;
+  let spyHttpClientGetJson: any;
+
+  beforeEach(() => {
+    (core.debug as jest.Mock).mockImplementation(() => {});
+    (core.error as jest.Mock).mockImplementation(() => {});
+    spyHttpClientGetJson = jest.spyOn(HttpClient.prototype, 'getJson');
+    spyHttpClientGetJson.mockResolvedValue({
+      statusCode: 200,
+      result: {most_recent_feature_release: 25},
+      headers: {}
+    });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('resolves the newest major version from the Adoptium API', async () => {
+    spyHttpClientHead = jest.spyOn(HttpClient.prototype, 'head');
+    spyHttpClientHead.mockResolvedValue({message: {statusCode: 200}});
+    jest.spyOn(HttpClient.prototype, 'get').mockResolvedValue({
+      message: {statusCode: 200},
+      readBody: async () => 'f'.repeat(64)
+    } as any);
+
+    const distribution = new OracleDistribution({
+      version: 'latest',
+      architecture: 'x64',
+      packageType: 'jdk',
+      checkLatest: false
+    });
+
+    const result = await distribution['findPackageForDownload']('x');
+    const osType = distribution.getPlatform();
+    const archiveType = getDownloadArchiveExtension();
+
+    expect(result.version).toBe('25');
+    expect(result.url).toBe(
+      `https://download.oracle.com/java/25/latest/jdk-25_${osType}-x64_bin.${archiveType}`
+    );
+  });
+
+  it('throws an actionable error when the latest major is not yet available', async () => {
+    spyHttpClientHead = jest.spyOn(HttpClient.prototype, 'head');
+    spyHttpClientHead.mockResolvedValue({message: {statusCode: 404}});
+
+    const distribution = new OracleDistribution({
+      version: 'latest',
+      architecture: 'x64',
+      packageType: 'jdk',
+      checkLatest: false
+    });
+
+    await expect(distribution['findPackageForDownload']('x')).rejects.toThrow(
+      /is not yet available for the Oracle JDK distribution/
     );
   });
 });

@@ -1,12 +1,59 @@
+import {
+  jest,
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  beforeAll,
+  afterAll
+} from '@jest/globals';
 import {HttpClient} from '@actions/http-client';
-import {DragonwellDistribution} from '../../src/distributions/dragonwell/installer';
-import * as utils from '../../src/util';
 
-import manifestData from '../data/dragonwell.json';
+import manifestData from '../data/dragonwell.json' with {type: 'json'};
+
+// Mock @actions/core before importing source modules that depend on it
+jest.unstable_mockModule('@actions/core', () => ({
+  info: jest.fn(),
+  warning: jest.fn(),
+  debug: jest.fn(),
+  error: jest.fn(),
+  notice: jest.fn(),
+  setFailed: jest.fn(),
+  setOutput: jest.fn(),
+  getInput: jest.fn(),
+  getBooleanInput: jest.fn(),
+  getMultilineInput: jest.fn(),
+  addPath: jest.fn(),
+  exportVariable: jest.fn(),
+  saveState: jest.fn(),
+  getState: jest.fn(),
+  setSecret: jest.fn(),
+  isDebug: jest.fn(() => false),
+  startGroup: jest.fn(),
+  endGroup: jest.fn(),
+  group: jest.fn((_name: string, fn: () => Promise<unknown>) => fn()),
+  toPlatformPath: jest.fn((p: string) => p),
+  toWin32Path: jest.fn((p: string) => p),
+  toPosixPath: jest.fn((p: string) => p)
+}));
+
+const real_util_module = await import('../../src/util.js');
+jest.unstable_mockModule('../../src/util.js', () => ({
+  ...real_util_module,
+  getDownloadArchiveExtension: jest.fn()
+}));
+
+// Dynamic imports after mocking
+const core = await import('@actions/core');
+const {DragonwellDistribution} =
+  await import('../../src/distributions/dragonwell/installer.js');
+const utils = await import('../../src/util.js');
 
 describe('getAvailableVersions', () => {
-  let spyHttpClient: jest.SpyInstance;
-  let spyUtilGetDownloadArchiveExtension: jest.SpyInstance;
+  let spyHttpClient: any;
+  let spyUtilGetDownloadArchiveExtension: any;
+  let spyCoreError: any;
 
   beforeEach(() => {
     spyHttpClient = jest.spyOn(HttpClient.prototype, 'getJson');
@@ -16,11 +63,13 @@ describe('getAvailableVersions', () => {
       result: manifestData
     });
 
-    spyUtilGetDownloadArchiveExtension = jest.spyOn(
-      utils,
-      'getDownloadArchiveExtension'
-    );
+    spyUtilGetDownloadArchiveExtension =
+      utils.getDownloadArchiveExtension as jest.Mock;
     spyUtilGetDownloadArchiveExtension.mockReturnValue('tar.gz');
+
+    // Mock core.error to suppress error logs
+    spyCoreError = core.error as jest.Mock;
+    spyCoreError.mockImplementation(() => {});
   });
 
   afterEach(() => {
@@ -30,7 +79,7 @@ describe('getAvailableVersions', () => {
   });
 
   const mockPlatform = (
-    distribution: DragonwellDistribution,
+    distribution: InstanceType<typeof DragonwellDistribution>,
     platform: string
   ) => {
     distribution['getPlatformOption'] = () => platform;
@@ -210,6 +259,10 @@ describe('getAvailableVersions', () => {
           await distribution['findPackageForDownload'](jdkVersion);
         expect(availableVersion).not.toBeNull();
         expect(availableVersion.url).toBe(expectedLink);
+        expect(availableVersion.checksum).toEqual({
+          algorithm: 'sha256',
+          value: expect.stringMatching(/^[a-f0-9]{64}$/)
+        });
       }
     );
 
@@ -219,7 +272,7 @@ describe('getAvailableVersions', () => {
       ['11', 'macos', 'aarch64'],
       ['17', 'linux', 'riscv']
     ])(
-      'should throw when required version of JDK can not be found in the JSON',
+      'should throw when required version of JDK cannot be found in the JSON',
       async (jdkVersion: string, platform: string, arch: string) => {
         const distribution = new DragonwellDistribution({
           version: jdkVersion,
@@ -232,7 +285,7 @@ describe('getAvailableVersions', () => {
         await expect(
           distribution['findPackageForDownload'](jdkVersion)
         ).rejects.toThrow(
-          `Couldn't find any satisfied version for the specified java-version: "${jdkVersion}" and architecture: "${arch}".`
+          `No matching version found for SemVer '${jdkVersion}'`
         );
       }
     );

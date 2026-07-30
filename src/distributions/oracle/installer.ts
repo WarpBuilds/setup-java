@@ -4,18 +4,20 @@ import * as tc from '@actions/tool-cache';
 import fs from 'fs';
 import path from 'path';
 
-import {JavaBase} from '../base-installer';
+import {JavaBase} from '../base-installer.js';
 import {
   JavaDownloadRelease,
   JavaInstallerOptions,
   JavaInstallerResults
-} from '../base-models';
+} from '../base-models.js';
 import {
   extractJdkFile,
   getDownloadArchiveExtension,
+  getLatestMajorVersion,
   renameWinArchive
-} from '../../util';
+} from '../../util.js';
 import {HttpCodes} from '@actions/http-client';
+import {OsVersions} from './models.js';
 
 const ORACLE_DL_BASE = 'https://download.oracle.com/java';
 
@@ -30,7 +32,7 @@ export class OracleDistribution extends JavaBase {
     core.info(
       `Downloading Java ${javaRelease.version} (${this.distribution}) from ${javaRelease.url} ...`
     );
-    let javaArchivePath = await tc.downloadTool(javaRelease.url);
+    let javaArchivePath = await this.downloadAndVerify(javaRelease);
 
     core.info(`Extracting Java archive...`);
     const extension = getDownloadArchiveExtension();
@@ -72,6 +74,14 @@ export class OracleDistribution extends JavaBase {
     const platform = this.getPlatform();
     const extension = getDownloadArchiveExtension();
 
+    // The `latest` alias is normalized to the SemVer wildcard. Oracle builds its
+    // download URLs from a concrete major and has no endpoint to list releases,
+    // so resolve the newest available GA major from the Adoptium API and use it.
+    if (this.latest) {
+      const latestMajor = await getLatestMajorVersion(this.http);
+      range = latestMajor.toString();
+    }
+
     const isOnlyMajorProvided = !range.includes('.');
     const major = isOnlyMajorProvided ? range : range.split('.')[0];
 
@@ -102,7 +112,11 @@ export class OracleDistribution extends JavaBase {
       const response = await this.http.head(url);
 
       if (response.message.statusCode === HttpCodes.OK) {
-        return {url, version: range};
+        return {
+          url,
+          version: range,
+          checksum: await this.fetchChecksum(`${url}.sha256`, 'sha256')
+        };
       }
 
       if (response.message.statusCode !== HttpCodes.NotFound) {
@@ -112,7 +126,13 @@ export class OracleDistribution extends JavaBase {
       }
     }
 
-    throw new Error(`Could not find Oracle JDK for SemVer ${range}`);
+    if (this.latest) {
+      const error = this.createVersionNotFoundError(range);
+      error.message += `\nThe latest Java major version (${range}) is not yet available for the Oracle JDK distribution. Please specify a concrete version instead of 'latest'.`;
+      throw error;
+    }
+
+    throw this.createVersionNotFoundError(range);
   }
 
   public getPlatform(platform: NodeJS.Platform = process.platform): OsVersions {

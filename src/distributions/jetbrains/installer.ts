@@ -5,14 +5,14 @@ import fs from 'fs';
 import path from 'path';
 import semver from 'semver';
 
-import {JavaBase} from '../base-installer';
-import {IJetBrainsRawVersion, IJetBrainsVersion} from './models';
+import {JavaBase} from '../base-installer.js';
+import {IJetBrainsRawVersion, IJetBrainsVersion} from './models.js';
 import {
   JavaDownloadRelease,
   JavaInstallerOptions,
   JavaInstallerResults
-} from '../base-models';
-import {extractJdkFile, isVersionSatisfies} from '../../util';
+} from '../base-models.js';
+import {extractJdkFile, isVersionSatisfies} from '../../util.js';
 import {OutgoingHttpHeaders} from 'http';
 import {HttpCodes} from '@actions/http-client';
 
@@ -44,18 +44,23 @@ export class JetBrainsDistribution extends JavaBase {
     const resolvedFullVersion =
       satisfiedVersions.length > 0 ? satisfiedVersions[0] : null;
     if (!resolvedFullVersion) {
-      const availableOptions = versionsRaw
-        .map(item => `${item.tag_name} (${item.semver}+${item.build})`)
-        .join(', ');
-      const availableOptionsMessage = availableOptions
-        ? `\nAvailable versions: ${availableOptions}`
-        : '';
-      throw new Error(
-        `Could not find satisfied version for SemVer '${range}'. ${availableOptionsMessage}`
+      const availableVersionStrings = versionsRaw.map(
+        item => `${item.tag_name} (${item.semver}+${item.build})`
       );
+      throw this.createVersionNotFoundError(range, availableVersionStrings);
     }
 
-    return resolvedFullVersion;
+    return {
+      ...resolvedFullVersion,
+      // JetBrains' `.checksum` sibling doesn't disclose its algorithm via the
+      // filename, and older JBR builds (e.g. JBR 11) publish a SHA-256 digest
+      // there while newer builds publish SHA-512. Accept either, preferring
+      // the stronger SHA-512 when the digest length is ambiguous.
+      checksum: await this.fetchChecksum(
+        `${resolvedFullVersion.url}.checksum`,
+        ['sha512', 'sha256']
+      )
+    };
   }
 
   protected async downloadTool(
@@ -65,7 +70,7 @@ export class JetBrainsDistribution extends JavaBase {
       `Downloading Java ${javaRelease.version} (${this.distribution}) from ${javaRelease.url} ...`
     );
 
-    const javaArchivePath = await tc.downloadTool(javaRelease.url);
+    const javaArchivePath = await this.downloadAndVerify(javaRelease);
 
     core.info(`Extracting Java archive...`);
     const extractedJavaPath = await extractJdkFile(javaArchivePath, 'tar.gz');

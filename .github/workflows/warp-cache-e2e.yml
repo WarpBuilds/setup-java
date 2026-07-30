@@ -1,0 +1,106 @@
+name: warp-cache-e2e
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+jobs:
+  save:
+    name: save (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          [
+            warp-ubuntu-latest-x64-2x,
+            warp-windows-2022-x64-4x,
+            warp-macos-14-arm64-6x
+          ]
+    steps:
+      - uses: actions/checkout@v7
+
+      # The cache key is derived from this file's hash, so a per-run value
+      # guarantees a fresh key and a genuine miss -> save -> hit round trip.
+      - name: Write run-unique pom
+        shell: bash
+        run: |
+          mkdir -p warp-fixture
+          printf '<project><!-- warp-cache-e2e %s-%s --></project>\n' \
+            "${{ github.run_id }}" "${{ github.run_attempt }}" \
+            > warp-fixture/pom.xml
+
+      - name: Setup Java
+        id: setup
+        uses: ./
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: warp-fixture/pom.xml
+
+      - name: Assert cache miss on a fresh key
+        shell: bash
+        run: |
+          echo "primary-key: ${{ steps.setup.outputs.cache-primary-key }}"
+          if [ "${{ steps.setup.outputs.cache-hit }}" != "false" ]; then
+            echo "expected a miss on a run-unique key, got cache-hit=${{ steps.setup.outputs.cache-hit }}"
+            exit 1
+          fi
+
+      # Give the post step real bytes to upload without a full maven resolve.
+      - name: Populate the maven repository
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.m2/repository"
+          echo "warp-cache-e2e ${{ github.run_id }}" > "$HOME/.m2/repository/warp-e2e.txt"
+
+  restore:
+    name: restore (${{ matrix.os }})
+    needs: save
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          [
+            warp-ubuntu-latest-x64-2x,
+            warp-windows-2022-x64-4x,
+            warp-macos-14-arm64-6x
+          ]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Write the same run-unique pom
+        shell: bash
+        run: |
+          mkdir -p warp-fixture
+          printf '<project><!-- warp-cache-e2e %s-%s --></project>\n' \
+            "${{ github.run_id }}" "${{ github.run_attempt }}" \
+            > warp-fixture/pom.xml
+
+      - name: Setup Java
+        id: setup
+        uses: ./
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: warp-fixture/pom.xml
+
+      - name: Assert the cache saved by the save job was restored
+        shell: bash
+        run: |
+          if [ "${{ steps.setup.outputs.cache-hit }}" != "true" ]; then
+            echo "expected an exact-key hit on the cache saved by the save job"
+            exit 1
+          fi
+          test -f "$HOME/.m2/repository/warp-e2e.txt"
+          echo "restored marker: $(cat "$HOME/.m2/repository/warp-e2e.txt")"

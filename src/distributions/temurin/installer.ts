@@ -4,37 +4,61 @@ import * as tc from '@actions/tool-cache';
 import fs from 'fs';
 import path from 'path';
 import semver from 'semver';
+import * as gpg from '../../gpg.js';
 
-import {JavaBase} from '../base-installer';
-import {ITemurinAvailableVersions} from './models';
+import {ADOPTIUM_PUBLIC_KEY} from './adoptium-key.js';
+import {JavaBase} from '../base-installer.js';
+import {ITemurinAvailableVersions} from './models.js';
+import {MACOS_JAVA_CONTENT_POSTFIX} from '../../constants.js';
 import {
   JavaDownloadRelease,
   JavaInstallerOptions,
   JavaInstallerResults
-} from '../base-models';
+} from '../base-models.js';
 import {
   extractJdkFile,
+  getNextPageUrlFromLinkHeader,
   getDownloadArchiveExtension,
   isVersionSatisfies,
-  renameWinArchive
-} from '../../util';
+  renameWinArchive,
+  MAX_PAGINATION_PAGES,
+  validatePaginationUrl
+} from '../../util.js';
+
+export {ADOPTIUM_PUBLIC_KEY} from './adoptium-key.js';
 
 export enum TemurinImplementation {
   Hotspot = 'Hotspot'
 }
 
 export class TemurinDistribution extends JavaBase {
+  private readonly includeJmods: boolean;
+
   constructor(
     installerOptions: JavaInstallerOptions,
     private readonly jvmImpl: TemurinImplementation
   ) {
     super(`Temurin-${jvmImpl}`, installerOptions);
+    this.includeJmods = this.packageType === 'jdk+jmods';
   }
 
-  protected async findPackageForDownload(
+  /**
+   * @internal For cross-distribution reuse only. Not intended as a public API.
+   */
+  public async findPackageForDownload(
     version: string
   ): Promise<JavaDownloadRelease> {
-    const availableVersionsRaw = await this.getAvailableVersions();
+    return this.resolvePackage(
+      version,
+      this.includeJmods ? 'jdk' : this.packageType
+    );
+  }
+
+  private async resolvePackage(
+    version: string,
+    imageType: string
+  ): Promise<JavaDownloadRelease> {
+    const availableVersionsRaw = await this.getAvailableVersions(imageType);
     const availableVersionsWithBinaries = availableVersionsRaw
       .filter(item => item.binaries.length > 0)
       .map(item => {
@@ -44,7 +68,13 @@ export class TemurinDistribution extends JavaBase {
           : item.version_data.semver.replace('-beta+', '+');
         return {
           version: formattedVersion,
-          url: item.binaries[0].package.link
+          url: item.binaries[0].package.link,
+          signatureUrl: item.binaries[0].package.signature_link,
+          checksum: {
+            algorithm: 'sha256',
+            value: item.binaries[0].package.checksum,
+            source: item.binaries[0].package.checksum_link
+          }
         } as JavaDownloadRelease;
       });
 
@@ -57,15 +87,10 @@ export class TemurinDistribution extends JavaBase {
     const resolvedFullVersion =
       satisfiedVersions.length > 0 ? satisfiedVersions[0] : null;
     if (!resolvedFullVersion) {
-      const availableOptions = availableVersionsWithBinaries
-        .map(item => item.version)
-        .join(', ');
-      const availableOptionsMessage = availableOptions
-        ? `\nAvailable versions: ${availableOptions}`
-        : '';
-      throw new Error(
-        `Could not find satisfied version for SemVer '${version}'. ${availableOptionsMessage}`
+      const availableVersionStrings = availableVersionsWithBinaries.map(
+        item => item.version
       );
+      throw this.createVersionNotFoundError(version, availableVersionStrings);
     }
 
     return resolvedFullVersion;
@@ -77,7 +102,7 @@ export class TemurinDistribution extends JavaBase {
     core.info(
       `Downloading Java ${javaRelease.version} (${this.distribution}) from ${javaRelease.url} ...`
     );
-    let javaArchivePath = await tc.downloadTool(javaRelease.url);
+    let javaArchivePath = await this.downloadPackage(javaRelease);
 
     core.info(`Extracting Java archive...`);
     const extension = getDownloadArchiveExtension();
@@ -88,6 +113,13 @@ export class TemurinDistribution extends JavaBase {
 
     const archiveName = fs.readdirSync(extractedJavaPath)[0];
     const archivePath = path.join(extractedJavaPath, archiveName);
+    const javaHome =
+      process.platform === 'darwin'
+        ? path.join(archivePath, MACOS_JAVA_CONTENT_POSTFIX)
+        : archivePath;
+    if (this.includeJmods && !fs.existsSync(path.join(javaHome, 'jmods'))) {
+      await this.installJmods(javaRelease.version, javaHome);
+    }
     const version = this.getToolcacheVersionName(javaRelease.version);
 
     const javaPath = await tc.cacheDir(
@@ -100,14 +132,64 @@ export class TemurinDistribution extends JavaBase {
     return {version: javaRelease.version, path: javaPath};
   }
 
-  protected get toolcacheFolderName(): string {
-    return super.toolcacheFolderName;
+  protected supportsSignatureVerification(): boolean {
+    return true;
   }
 
-  private async getAvailableVersions(): Promise<ITemurinAvailableVersions[]> {
+  private async downloadPackage(release: JavaDownloadRelease): Promise<string> {
+    const archivePath = await this.downloadAndVerify(release);
+
+    if (this.verifySignature) {
+      if (!release.signatureUrl) {
+        throw new Error(
+          `Input 'verify-signature' is enabled, but no signature URL was found for Temurin version ${release.version}.`
+        );
+      }
+      core.info(`Verifying Java package signature...`);
+      try {
+        await gpg.verifyPackageSignature(
+          archivePath,
+          release.signatureUrl,
+          this.verifySignaturePublicKey ?? ADOPTIUM_PUBLIC_KEY
+        );
+      } catch (error) {
+        throw new Error(
+          `Failed to verify signature for Temurin version ${release.version} from ${release.signatureUrl}: ${
+            (error as Error).message
+          }`,
+          {cause: error}
+        );
+      }
+    }
+
+    return archivePath;
+  }
+
+  private async installJmods(version: string, javaHome: string): Promise<void> {
+    const jmodsRelease = await this.resolvePackage(version, 'jmods');
+    core.info(
+      `Downloading JMODs ${jmodsRelease.version} (${this.distribution}) from ${jmodsRelease.url} ...`
+    );
+    let jmodsArchivePath = await this.downloadPackage(jmodsRelease);
+    if (process.platform === 'win32') {
+      jmodsArchivePath = renameWinArchive(jmodsArchivePath);
+    }
+    const extractedJmodsPath = await extractJdkFile(
+      jmodsArchivePath,
+      getDownloadArchiveExtension()
+    );
+    const jmodsDirectory = path.join(
+      extractedJmodsPath,
+      fs.readdirSync(extractedJmodsPath)[0]
+    );
+    fs.cpSync(jmodsDirectory, path.join(javaHome, 'jmods'), {recursive: true});
+  }
+
+  private async getAvailableVersions(
+    imageType = this.includeJmods ? 'jdk' : this.packageType
+  ): Promise<ITemurinAvailableVersions[]> {
     const platform = this.getPlatformOption();
     const arch = this.distributionArchitecture();
-    const imageType = this.packageType;
     const versionRange = encodeURI('[1.0,100.0]'); // retrieve all available versions
     const releaseType = this.stable ? 'ga' : 'ea';
 
@@ -128,32 +210,47 @@ export class TemurinDistribution extends JavaBase {
       `jvm_impl=${this.jvmImpl.toLowerCase()}`
     ].join('&');
 
-    // need to iterate through all pages to retrieve the list of all versions
-    // Adoptium API doesn't provide way to retrieve the count of pages to iterate so infinity loop
-    let page_index = 0;
+    const requestArguments = `${baseRequestArguments}&page_size=20&page=0`;
+    let availableVersionsUrl: string | null =
+      `https://api.adoptium.net/v3/assets/version/${versionRange}?${requestArguments}`;
     const availableVersions: ITemurinAvailableVersions[] = [];
-    while (true) {
-      const requestArguments = `${baseRequestArguments}&page_size=20&page=${page_index}`;
-      const availableVersionsUrl = `https://api.adoptium.net/v3/assets/version/${versionRange}?${requestArguments}`;
-      if (core.isDebug() && page_index === 0) {
-        // url is identical except page_index so print it once for debug
-        core.debug(
-          `Gathering available versions from '${availableVersionsUrl}'`
-        );
-      }
+    let pageCount = 0;
+    if (core.isDebug()) {
+      core.debug(`Gathering available versions from '${availableVersionsUrl}'`);
+    }
 
-      const paginationPage = (
+    while (availableVersionsUrl) {
+      pageCount++;
+      const response =
         await this.http.getJson<ITemurinAvailableVersions[]>(
           availableVersionsUrl
-        )
-      ).result;
+        );
+      const paginationPage = response.result;
+      const nextUrl = getNextPageUrlFromLinkHeader(response.headers);
+      if (
+        nextUrl &&
+        !validatePaginationUrl(nextUrl, 'https://api.adoptium.net')
+      ) {
+        core.warning(
+          `Ignoring pagination link with unexpected origin: ${nextUrl}`
+        );
+        availableVersionsUrl = null;
+      } else {
+        availableVersionsUrl = nextUrl;
+      }
+
       if (paginationPage === null || paginationPage.length === 0) {
-        // break infinity loop because we have reached end of pagination
         break;
       }
 
       availableVersions.push(...paginationPage);
-      page_index++;
+
+      if (pageCount >= MAX_PAGINATION_PAGES) {
+        core.warning(
+          `Reached pagination safeguard limit (${MAX_PAGINATION_PAGES} pages) while listing Temurin releases.`
+        );
+        break;
+      }
     }
 
     if (core.isDebug()) {
@@ -176,8 +273,18 @@ export class TemurinDistribution extends JavaBase {
         return 'mac';
       case 'win32':
         return 'windows';
+      case 'linux':
+        if (fs.existsSync('/etc/alpine-release')) {
+          return 'alpine-linux';
+        }
+        return 'linux';
       default:
         return process.platform;
     }
+  }
+
+  protected distributionArchitecture(): string {
+    const architecture = super.distributionArchitecture();
+    return architecture === 'armv7' ? 'arm' : architecture;
   }
 }

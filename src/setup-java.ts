@@ -1,53 +1,50 @@
 import fs from 'fs';
 import * as core from '@actions/core';
-import * as auth from './auth';
-import {
-  getBooleanInput,
-  isCacheFeatureAvailable,
-  getVersionFromFileContent
-} from './util';
-import * as toolchains from './toolchains';
-import * as constants from './constants';
-import {restore} from './cache';
+import * as auth from './auth.js';
+import {getBooleanInput, getVersionFromFileContent} from './util.js';
+import * as toolchains from './toolchains.js';
+import * as constants from './constants.js';
 import * as path from 'path';
-import {getJavaDistribution} from './distributions/distribution-factory';
-import {JavaInstallerOptions} from './distributions/base-models';
+import {fileURLToPath} from 'url';
+import {getJavaDistribution} from './distributions/distribution-factory.js';
+import {JavaInstallerOptions} from './distributions/base-models.js';
+import {configureMavenArgs} from './maven-args.js';
+import {configureProblemMatcher} from './problem-matcher.js';
 
-async function run() {
+export async function run() {
+  const versions = core.getMultilineInput(constants.INPUT_JAVA_VERSION);
+  let distributionName = core.getInput(constants.INPUT_DISTRIBUTION);
+  const versionFile = core.getInput(constants.INPUT_JAVA_VERSION_FILE);
+  const architecture = core.getInput(constants.INPUT_ARCHITECTURE);
+  const packageType = core.getInput(constants.INPUT_JAVA_PACKAGE);
+  const jdkFile = getJdkFileInput();
+  const cache = core.getInput(constants.INPUT_CACHE);
+  const cacheDependencyPath = core.getInput(
+    constants.INPUT_CACHE_DEPENDENCY_PATH
+  );
+  const cachePath = core.getMultilineInput(constants.INPUT_CACHE_PATH);
+  const checkLatest = getBooleanInput(constants.INPUT_CHECK_LATEST, false);
+  const forceDownload = getBooleanInput(constants.INPUT_FORCE_DOWNLOAD, false);
+  const setDefault = getBooleanInput(constants.INPUT_SET_DEFAULT, true);
+  const verifySignature = getBooleanInput(
+    constants.INPUT_VERIFY_SIGNATURE,
+    false
+  );
+  const verifySignaturePublicKey =
+    core.getInput(constants.INPUT_VERIFY_SIGNATURE_PUBLIC_KEY) || undefined;
+  const toolchainIds = core.getMultilineInput(constants.INPUT_MVN_TOOLCHAIN_ID);
+
+  let actionError: Error | undefined;
+  let cacheRestore: Promise<void> | undefined;
+
   try {
-    const versions = core.getMultilineInput(constants.INPUT_JAVA_VERSION);
-    const distributionName = core.getInput(constants.INPUT_DISTRIBUTION, {
-      required: true
-    });
-    const versionFile = core.getInput(constants.INPUT_JAVA_VERSION_FILE);
-    const architecture = core.getInput(constants.INPUT_ARCHITECTURE);
-    const packageType = core.getInput(constants.INPUT_JAVA_PACKAGE);
-    const jdkFile = core.getInput(constants.INPUT_JDK_FILE);
-    const cache = core.getInput(constants.INPUT_CACHE);
-    const cacheDependencyPath = core.getInput(
-      constants.INPUT_CACHE_DEPENDENCY_PATH
-    );
-    const checkLatest = getBooleanInput(constants.INPUT_CHECK_LATEST, false);
-    let toolchainIds = core.getMultilineInput(constants.INPUT_MVN_TOOLCHAIN_ID);
-
     core.startGroup('Installed distributions');
-
-    if (versions.length !== toolchainIds.length) {
-      toolchainIds = [];
-    }
 
     if (!versions.length && !versionFile) {
       throw new Error('java-version or java-version-file input expected');
     }
 
-    const installerInputsOptions: installerInputsOptions = {
-      architecture,
-      packageType,
-      checkLatest,
-      distributionName,
-      jdkFile,
-      toolchainIds
-    };
+    toolchains.validateToolchainIds(versions, versionFile, toolchainIds);
 
     if (!versions.length) {
       core.debug(
@@ -55,39 +52,123 @@ async function run() {
       );
       const content = fs.readFileSync(versionFile).toString().trim();
 
-      const version = getVersionFromFileContent(
+      const versionInfo = getVersionFromFileContent(
         content,
         distributionName,
         versionFile
       );
-      core.debug(`Parsed version from file '${version}'`);
+      core.debug(`Parsed version from file '${versionInfo?.version}'`);
 
-      if (!version) {
+      if (!versionInfo) {
         throw new Error(
           `No supported version was found in file ${versionFile}`
         );
       }
 
-      await installVersion(version, installerInputsOptions);
-    }
+      // Use distribution from file if available, otherwise use the input
+      if (versionInfo.distribution) {
+        core.info(
+          `Using distribution '${versionInfo.distribution}' from ${versionFile}`
+        );
+        distributionName = versionInfo.distribution;
+      } else if (!distributionName) {
+        throw new Error(
+          'distribution input is required when not specified in the version file'
+        );
+      }
 
-    for (const [index, version] of versions.entries()) {
-      await installVersion(version, installerInputsOptions, index);
+      const installerInputsOptions: installerInputsOptions = {
+        architecture,
+        packageType,
+        checkLatest,
+        forceDownload,
+        setDefault,
+        verifySignature,
+        verifySignaturePublicKey,
+        distributionName,
+        jdkFile,
+        toolchainIds
+      };
+
+      cacheRestore = cache
+        ? startCacheRestore(cache, cacheDependencyPath, cachePath)
+        : undefined;
+      await installVersion(versionInfo.version, installerInputsOptions);
+    } else {
+      // When using java-version input, distribution is still required
+      if (!distributionName) {
+        throw new Error('distribution input is required');
+      }
+
+      const installerInputsOptions: installerInputsOptions = {
+        architecture,
+        packageType,
+        checkLatest,
+        forceDownload,
+        setDefault,
+        verifySignature,
+        verifySignaturePublicKey,
+        distributionName,
+        jdkFile,
+        toolchainIds
+      };
+
+      cacheRestore = cache
+        ? startCacheRestore(cache, cacheDependencyPath, cachePath)
+        : undefined;
+      for (const [index, version] of versions.entries()) {
+        await installVersion(version, installerInputsOptions, index);
+      }
     }
     core.endGroup();
-    const matchersPath = path.join(__dirname, '..', '..', '.github');
-    core.info(`##[add-matcher]${path.join(matchersPath, 'java.json')}`);
+    const matchersPath = path.join(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '..',
+      '..',
+      '.github'
+    );
+    configureProblemMatcher(path.join(matchersPath, 'java.json'));
 
     await auth.configureAuthentication();
-    if (cache && isCacheFeatureAvailable()) {
-      await restore(cache, cacheDependencyPath);
-    }
+    configureMavenArgs();
   } catch (error) {
-    core.setFailed((error as Error).message);
+    actionError = error as Error;
+  }
+
+  if (cacheRestore) {
+    try {
+      await cacheRestore;
+    } catch (error) {
+      if (!actionError) {
+        actionError = error as Error;
+      }
+    }
+  }
+
+  if (actionError) {
+    core.setFailed(actionError.message);
   }
 }
 
-run();
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  run();
+} else {
+  // https://nodejs.org/api/modules.html#modules_accessing_the_main_module
+  core.info('the script is loaded as a module, so skipping the execution');
+}
+
+function getJdkFileInput(): string {
+  const jdkFile = core.getInput(constants.INPUT_JDK_FILE);
+  const deprecatedJdkFile = core.getInput(constants.INPUT_JDK_FILE_DEPRECATED);
+
+  if (deprecatedJdkFile) {
+    core.warning(
+      `The '${constants.INPUT_JDK_FILE_DEPRECATED}' input is deprecated and may be removed in a future release. Please use '${constants.INPUT_JDK_FILE}' instead.`
+    );
+  }
+
+  return jdkFile || deprecatedJdkFile;
+}
 
 async function installVersion(
   version: string,
@@ -100,6 +181,10 @@ async function installVersion(
     architecture,
     packageType,
     checkLatest,
+    forceDownload,
+    setDefault,
+    verifySignature,
+    verifySignaturePublicKey,
     toolchainIds
   } = options;
 
@@ -107,10 +192,14 @@ async function installVersion(
     architecture,
     packageType,
     checkLatest,
+    forceDownload,
+    setDefault,
+    verifySignature,
+    verifySignaturePublicKey,
     version
   };
 
-  const distribution = getJavaDistribution(
+  const distribution = await getJavaDistribution(
     distributionName,
     installerOptions,
     jdkFile
@@ -122,8 +211,14 @@ async function installVersion(
   }
 
   const result = await distribution.setupJava();
+
+  // When the `latest` alias is used, the literal input isn't a real version, so
+  // pass the resolved version to the toolchains configuration instead.
+  const isLatest = version.trim().toLowerCase() === 'latest';
+  const toolchainVersion = isLatest ? result.version : version;
+
   await toolchains.configureToolchains(
-    version,
+    toolchainVersion,
     distributionName,
     result.path,
     toolchainIds[toolchainId]
@@ -141,7 +236,25 @@ interface installerInputsOptions {
   architecture: string;
   packageType: string;
   checkLatest: boolean;
+  forceDownload: boolean;
+  setDefault: boolean;
+  verifySignature: boolean;
+  verifySignaturePublicKey: string | undefined;
   distributionName: string;
   jdkFile: string;
   toolchainIds: Array<string>;
+}
+
+async function startCacheRestore(
+  cache: string,
+  cacheDependencyPath: string,
+  cachePath: string[]
+): Promise<void> {
+  const {isCacheFeatureAvailable} = await import('./cache-feature.js');
+  if (!isCacheFeatureAvailable()) {
+    return;
+  }
+
+  const {restore} = await import('./cache.js');
+  await restore(cache, cacheDependencyPath, cachePath);
 }

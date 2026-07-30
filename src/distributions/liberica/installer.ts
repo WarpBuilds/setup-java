@@ -1,18 +1,18 @@
-import {JavaBase} from '../base-installer';
+import {JavaBase} from '../base-installer.js';
 import {
   JavaDownloadRelease,
   JavaInstallerOptions,
   JavaInstallerResults
-} from '../base-models';
+} from '../base-models.js';
 import semver from 'semver';
 import {
   extractJdkFile,
   getDownloadArchiveExtension,
   isVersionSatisfies,
   renameWinArchive
-} from '../../util';
+} from '../../util.js';
 import * as core from '@actions/core';
-import {ArchitectureOptions, LibericaVersion, OsVersions} from './models';
+import {ArchitectureOptions, LibericaVersion, OsVersions} from './models.js';
 import * as tc from '@actions/tool-cache';
 import fs from 'fs';
 import path from 'path';
@@ -32,7 +32,7 @@ export class LibericaDistributions extends JavaBase {
     core.info(
       `Downloading Java ${javaRelease.version} (${this.distribution}) from ${javaRelease.url} ...`
     );
-    let javaArchivePath = await tc.downloadTool(javaRelease.url);
+    let javaArchivePath = await this.downloadAndVerify(javaRelease);
 
     core.info(`Extracting Java archive...`);
     const extension = getDownloadArchiveExtension();
@@ -69,15 +69,10 @@ export class LibericaDistributions extends JavaBase {
       .sort((a, b) => -semver.compareBuild(a.version, b.version))[0];
 
     if (!satisfiedVersion) {
-      const availableOptions = availableVersions
-        .map(item => item.version)
-        .join(', ');
-      const availableOptionsMessage = availableOptions
-        ? `\nAvailable versions: ${availableOptions}`
-        : '';
-      throw new Error(
-        `Could not find satisfied version for semver ${range}. ${availableOptionsMessage}`
+      const availableVersionStrings = availableVersions.map(
+        item => item.version
       );
+      throw this.createVersionNotFoundError(range, availableVersionStrings);
     }
 
     return satisfiedVersion;

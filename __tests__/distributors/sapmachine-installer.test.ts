@@ -1,12 +1,61 @@
+import {
+  jest,
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  beforeAll,
+  afterAll
+} from '@jest/globals';
 import {HttpClient} from '@actions/http-client';
-import {SapMachineDistribution} from '../../src/distributions/sapmachine/installer';
-import * as utils from '../../src/util';
 
-import manifestData from '../data/sapmachine.json';
+import manifestData from '../data/sapmachine.json' with {type: 'json'};
+
+// Mock @actions/core before importing source modules that depend on it
+jest.unstable_mockModule('@actions/core', () => ({
+  info: jest.fn(),
+  warning: jest.fn(),
+  debug: jest.fn(),
+  error: jest.fn(),
+  notice: jest.fn(),
+  setFailed: jest.fn(),
+  setOutput: jest.fn(),
+  getInput: jest.fn(),
+  getBooleanInput: jest.fn(),
+  getMultilineInput: jest.fn(),
+  addPath: jest.fn(),
+  exportVariable: jest.fn(),
+  saveState: jest.fn(),
+  getState: jest.fn(),
+  setSecret: jest.fn(),
+  isDebug: jest.fn(() => false),
+  startGroup: jest.fn(),
+  endGroup: jest.fn(),
+  group: jest.fn((_name: string, fn: () => Promise<unknown>) => fn()),
+  toPlatformPath: jest.fn((p: string) => p),
+  toWin32Path: jest.fn((p: string) => p),
+  toPosixPath: jest.fn((p: string) => p)
+}));
+
+const real_util_module = await import('../../src/util.js');
+jest.unstable_mockModule('../../src/util.js', () => ({
+  ...real_util_module,
+  getDownloadArchiveExtension: jest.fn()
+}));
+
+// Dynamic imports after mocking
+const core = await import('@actions/core');
+const {SapMachineDistribution} =
+  await import('../../src/distributions/sapmachine/installer.js');
+const utils = await import('../../src/util.js');
 
 describe('getAvailableVersions', () => {
-  let spyHttpClient: jest.SpyInstance;
-  let spyUtilGetDownloadArchiveExtension: jest.SpyInstance;
+  let spyHttpClient: any;
+  let spyHttpGet: any;
+  let spyUtilGetDownloadArchiveExtension: any;
+  let spyCoreError: any;
+  const archiveChecksum = 'f'.repeat(64);
 
   beforeEach(() => {
     spyHttpClient = jest.spyOn(HttpClient.prototype, 'getJson');
@@ -15,12 +64,19 @@ describe('getAvailableVersions', () => {
       headers: {},
       result: manifestData
     });
+    spyHttpGet = jest.spyOn(HttpClient.prototype, 'get');
+    spyHttpGet.mockResolvedValue({
+      message: {statusCode: 200},
+      readBody: async () => `${archiveChecksum}  archive`
+    });
 
-    spyUtilGetDownloadArchiveExtension = jest.spyOn(
-      utils,
-      'getDownloadArchiveExtension'
-    );
+    spyUtilGetDownloadArchiveExtension =
+      utils.getDownloadArchiveExtension as jest.Mock<any>;
     spyUtilGetDownloadArchiveExtension.mockReturnValue('tar.gz');
+
+    // Mock core.error to suppress error logs
+    spyCoreError = core.error as jest.Mock;
+    spyCoreError.mockImplementation(() => {});
   });
 
   afterEach(() => {
@@ -30,7 +86,7 @@ describe('getAvailableVersions', () => {
   });
 
   const mockPlatform = (
-    distribution: SapMachineDistribution,
+    distribution: InstanceType<typeof SapMachineDistribution>,
     platform: string
   ) => {
     distribution['getPlatformOption'] = () => platform;
@@ -233,8 +289,30 @@ describe('getAvailableVersions', () => {
           await distribution['findPackageForDownload'](normalizedVersion);
         expect(availableVersion).not.toBeNull();
         expect(availableVersion.url).toBe(expectedLink);
+        expect(availableVersion.checksum).toEqual({
+          algorithm: 'sha256',
+          value: archiveChecksum,
+          source: expectedLink.replace(/\.(?:tar\.gz|zip)$/, '.sha256.txt')
+        });
       }
     );
+
+    it('uses the checksum published beside the selected EA archive', async () => {
+      const distribution = new SapMachineDistribution({
+        version: '21-ea',
+        architecture: 'x64',
+        packageType: 'jdk',
+        checkLatest: false
+      });
+      mockPlatform(distribution, 'linux');
+
+      const release = await distribution['findPackageForDownload']('21');
+
+      expect(spyHttpGet).toHaveBeenCalledWith(
+        release.url.replace(/\.(?:tar\.gz|zip)$/, '.sha256.txt')
+      );
+      expect(release.checksum?.value).toBe(archiveChecksum);
+    });
 
     it.each([
       ['8', 'linux', 'x64'],
@@ -248,7 +326,7 @@ describe('getAvailableVersions', () => {
       ['21.0.3+8-ea', 'linux', 'x64', '21.0.3+8'],
       ['17', 'linux-muse', 'aarch64']
     ])(
-      'should throw when required version of JDK can not be found in the JSON',
+      'should throw when required version of JDK cannot be found in the JSON',
       async (
         version: string,
         platform: string,
@@ -266,7 +344,7 @@ describe('getAvailableVersions', () => {
         await expect(
           distribution['findPackageForDownload'](normalizedVersion)
         ).rejects.toThrow(
-          `Couldn't find any satisfied version for the specified java-version: "${normalizedVersion}" and architecture: "${arch}".`
+          `No matching version found for SemVer '${normalizedVersion}'`
         );
       }
     );
