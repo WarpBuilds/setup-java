@@ -1,18 +1,92 @@
-import * as tc from '@actions/tool-cache';
-import * as core from '@actions/core';
-import * as util from '../../src/util';
-
-import path from 'path';
-import * as semver from 'semver';
-
-import {JavaBase} from '../../src/distributions/base-installer';
 import {
+  jest,
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  beforeAll,
+  afterAll
+} from '@jest/globals';
+import type {
   JavaDownloadRelease,
   JavaInstallerOptions,
   JavaInstallerResults
-} from '../../src/distributions/base-models';
+} from '../../src/distributions/base-models.js';
+
+import path from 'path';
+import * as semver from 'semver';
+import fs from 'fs';
+import {createHash} from 'crypto';
+import {HttpClient} from '@actions/http-client';
 
 import os from 'os';
+
+// Mock @actions/core before importing source modules that depend on it
+jest.unstable_mockModule('@actions/core', () => ({
+  info: jest.fn(),
+  warning: jest.fn(),
+  debug: jest.fn(),
+  error: jest.fn(),
+  notice: jest.fn(),
+  setFailed: jest.fn(),
+  setOutput: jest.fn(),
+  getInput: jest.fn(),
+  getBooleanInput: jest.fn(),
+  getMultilineInput: jest.fn(),
+  addPath: jest.fn(),
+  exportVariable: jest.fn(),
+  saveState: jest.fn(),
+  getState: jest.fn(),
+  setSecret: jest.fn(),
+  isDebug: jest.fn(() => false),
+  startGroup: jest.fn(),
+  endGroup: jest.fn(),
+  group: jest.fn((_name: string, fn: () => Promise<unknown>) => fn()),
+  toPlatformPath: jest.fn((p: string) => p),
+  toWin32Path: jest.fn((p: string) => p),
+  toPosixPath: jest.fn((p: string) => p)
+}));
+
+jest.unstable_mockModule('@actions/tool-cache', () => ({
+  find: jest.fn(),
+  findAllVersions: jest.fn(),
+  downloadTool: jest.fn(),
+  extractZip: jest.fn(),
+  extractTar: jest.fn(),
+  extract7z: jest.fn(),
+  extractXar: jest.fn(),
+  cacheDir: jest.fn(),
+  cacheFile: jest.fn(),
+  getManifestFromRepo: jest.fn(),
+  findFromManifest: jest.fn(),
+  evaluateVersions: jest.fn(),
+  HTTPError: class HTTPError extends Error {
+    httpStatusCode: number;
+    constructor(statusCode: number) {
+      super(`HTTP Error: ${statusCode}`);
+      this.httpStatusCode = statusCode;
+    }
+  }
+}));
+
+const real_util_module = await import('../../src/util.js');
+jest.unstable_mockModule('../../src/util.js', () => ({
+  ...real_util_module,
+  extractJdkFile: jest.fn(),
+  getDownloadArchiveExtension: jest.fn(),
+  getToolcachePath: jest.fn(),
+  isJobStatusSuccess: jest.fn(),
+  renameWinArchive: jest.fn(),
+  isVersionSatisfies: real_util_module.isVersionSatisfies,
+  getTempDir: real_util_module.getTempDir
+}));
+
+// Dynamic imports after mocking
+const core = await import('@actions/core');
+const tc = await import('@actions/tool-cache');
+const util = await import('../../src/util.js');
+const {JavaBase} = await import('../../src/distributions/base-installer.js');
 
 class EmptyJavaBase extends JavaBase {
   constructor(installerOptions: JavaInstallerOptions) {
@@ -38,13 +112,24 @@ class EmptyJavaBase extends JavaBase {
   ): Promise<JavaDownloadRelease> {
     const availableVersion = '11.0.9';
     if (!semver.satisfies(availableVersion, range)) {
-      throw new Error('Available version not found');
+      throw this.createVersionNotFoundError(range, [availableVersion]);
     }
 
     return {
       version: availableVersion,
       url: `some/random_url/java/${availableVersion}`
     };
+  }
+
+  public downloadRelease(javaRelease: JavaDownloadRelease): Promise<string> {
+    return this.downloadAndVerify(javaRelease);
+  }
+
+  public fetchChecksumForTest(
+    checksumUrl: string,
+    algorithm: 'sha256' | 'sha512' | ('sha256' | 'sha512')[]
+  ) {
+    return this.fetchChecksum(checksumUrl, algorithm);
   }
 }
 
@@ -53,12 +138,12 @@ describe('findInToolcache', () => {
   const javaPath = path.join('Java_Empty_jdk', actualJavaVersion, 'x64');
 
   let mockJavaBase: EmptyJavaBase;
-  let spyGetToolcachePath: jest.SpyInstance;
-  let spyTcFindAllVersions: jest.SpyInstance;
+  let spyGetToolcachePath: any;
+  let spyTcFindAllVersions: any;
 
   beforeEach(() => {
-    spyGetToolcachePath = jest.spyOn(util, 'getToolcachePath');
-    spyTcFindAllVersions = jest.spyOn(tc, 'findAllVersions');
+    spyGetToolcachePath = util.getToolcachePath as jest.Mock;
+    spyTcFindAllVersions = tc.findAllVersions as jest.Mock;
   });
 
   afterEach(() => {
@@ -241,16 +326,17 @@ describe('setupJava', () => {
 
   let mockJavaBase: EmptyJavaBase;
 
-  let spyGetToolcachePath: jest.SpyInstance;
-  let spyTcFindAllVersions: jest.SpyInstance;
-  let spyCoreDebug: jest.SpyInstance;
-  let spyCoreInfo: jest.SpyInstance;
-  let spyCoreExportVariable: jest.SpyInstance;
-  let spyCoreAddPath: jest.SpyInstance;
-  let spyCoreSetOutput: jest.SpyInstance;
+  let spyGetToolcachePath: any;
+  let spyTcFindAllVersions: any;
+  let spyCoreDebug: any;
+  let spyCoreInfo: any;
+  let spyCoreExportVariable: any;
+  let spyCoreAddPath: any;
+  let spyCoreSetOutput: any;
+  let spyCoreError: any;
 
   beforeEach(() => {
-    spyGetToolcachePath = jest.spyOn(util, 'getToolcachePath');
+    spyGetToolcachePath = util.getToolcachePath as jest.Mock;
     spyGetToolcachePath.mockImplementation(
       (toolname: string, javaVersion: string, architecture: string) => {
         const semverVersion = new semver.Range(javaVersion);
@@ -268,24 +354,28 @@ describe('setupJava', () => {
       }
     );
 
-    spyTcFindAllVersions = jest.spyOn(tc, 'findAllVersions');
+    spyTcFindAllVersions = tc.findAllVersions as jest.Mock;
     spyTcFindAllVersions.mockReturnValue([installedJavaVersion]);
 
     // Spy on core methods
-    spyCoreDebug = jest.spyOn(core, 'debug');
+    spyCoreDebug = core.debug as jest.Mock;
     spyCoreDebug.mockImplementation(() => undefined);
 
-    spyCoreInfo = jest.spyOn(core, 'info');
+    spyCoreInfo = core.info as jest.Mock;
     spyCoreInfo.mockImplementation(() => undefined);
 
-    spyCoreAddPath = jest.spyOn(core, 'addPath');
+    spyCoreAddPath = core.addPath as jest.Mock;
     spyCoreAddPath.mockImplementation(() => undefined);
 
-    spyCoreExportVariable = jest.spyOn(core, 'exportVariable');
+    spyCoreExportVariable = core.exportVariable as jest.Mock;
     spyCoreExportVariable.mockImplementation(() => undefined);
 
-    spyCoreSetOutput = jest.spyOn(core, 'setOutput');
+    spyCoreSetOutput = core.setOutput as jest.Mock;
     spyCoreSetOutput.mockImplementation(() => undefined);
+
+    // Mock core.error to suppress error logs
+    spyCoreError = core.error as jest.Mock;
+    spyCoreError.mockImplementation(() => undefined);
 
     jest.spyOn(os, 'arch').mockReturnValue('x86' as ReturnType<typeof os.arch>);
   });
@@ -342,6 +432,58 @@ describe('setupJava', () => {
       'Trying to resolve the latest version from remote'
     );
     expect(spyCoreInfo).not.toHaveBeenCalledWith('Trying to download...');
+  });
+
+  it('should resolve the latest version from remote when java-version is "latest", even if a version is cached', async () => {
+    mockJavaBase = new EmptyJavaBase({
+      version: 'latest',
+      architecture: 'x86',
+      packageType: 'jdk',
+      checkLatest: false
+    });
+
+    await expect(mockJavaBase.setupJava()).resolves.toEqual({
+      version: actualJavaVersion,
+      path: javaPathInstalled
+    });
+
+    // `latest` must bypass the tool-cache short-circuit and always resolve remotely
+    expect(spyCoreInfo).toHaveBeenCalledWith(
+      'Trying to resolve the latest version from remote'
+    );
+    expect(spyCoreInfo).toHaveBeenCalledWith('Trying to download...');
+    expect(spyCoreInfo).not.toHaveBeenCalledWith(
+      `Resolved Java ${installedJavaVersion} from tool-cache`
+    );
+  });
+
+  it('should download java when force-download is enabled, even if the version is cached', async () => {
+    mockJavaBase = new EmptyJavaBase({
+      version: actualJavaVersion,
+      architecture: 'x86',
+      packageType: 'jdk',
+      checkLatest: false,
+      forceDownload: true
+    });
+    const findInToolcache = jest.fn(() => ({
+      version: actualJavaVersion,
+      path: javaPathInstalled
+    }));
+    mockJavaBase['findInToolcache'] = findInToolcache;
+
+    await expect(mockJavaBase.setupJava()).resolves.toEqual({
+      version: actualJavaVersion,
+      path: javaPathInstalled
+    });
+
+    expect(findInToolcache).not.toHaveBeenCalled();
+    expect(spyCoreInfo).toHaveBeenCalledWith('Trying to download...');
+    expect(spyCoreInfo).toHaveBeenCalledWith(
+      `Java ${actualJavaVersion} was downloaded`
+    );
+    expect(spyCoreInfo).not.toHaveBeenCalledWith(
+      `Resolved Java ${actualJavaVersion} from tool-cache`
+    );
   });
 
   it.each([
@@ -459,6 +601,49 @@ describe('setupJava', () => {
     }
   );
 
+  it('should fail when verify-signature is enabled for unsupported distributions', async () => {
+    mockJavaBase = new EmptyJavaBase({
+      version: '11',
+      architecture: 'x86',
+      packageType: 'jdk',
+      checkLatest: false,
+      verifySignature: true
+    });
+
+    await expect(mockJavaBase.setupJava()).rejects.toThrow(
+      "Input 'verify-signature' is not supported for distribution 'Empty'."
+    );
+    expect(spyTcFindAllVersions).not.toHaveBeenCalled();
+    expect(spyCoreAddPath).not.toHaveBeenCalled();
+    expect(spyCoreExportVariable).not.toHaveBeenCalled();
+    expect(spyCoreSetOutput).not.toHaveBeenCalled();
+  });
+
+  it('should not repeat version resolution when downloadTool fails', async () => {
+    mockJavaBase = new EmptyJavaBase({
+      version: '11',
+      architecture: 'x86',
+      packageType: 'jdk',
+      checkLatest: false,
+      forceDownload: true
+    });
+    const findPackageForDownload = jest.fn(async () => ({
+      version: '11.0.9',
+      url: 'https://example.com/jdk.tar.gz'
+    }));
+    const downloadError = new Error('download failed');
+    const downloadTool = jest.fn(async () => {
+      throw downloadError;
+    });
+    mockJavaBase['findPackageForDownload'] = findPackageForDownload;
+    mockJavaBase['downloadTool'] = downloadTool;
+
+    await expect(mockJavaBase.setupJava()).rejects.toBe(downloadError);
+
+    expect(findPackageForDownload).toHaveBeenCalledTimes(1);
+    expect(downloadTool).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     [
       {
@@ -530,30 +715,438 @@ describe('setupJava', () => {
         checkLatest: false
       }
     ]
-  ])(
-    'should throw an error for Available version not found for %s',
-    async input => {
-      mockJavaBase = new EmptyJavaBase(input);
-      await expect(mockJavaBase.setupJava()).rejects.toThrow(
-        'Available version not found'
+  ])('should throw an error for version not found for %s', async input => {
+    mockJavaBase = new EmptyJavaBase(input);
+    await expect(mockJavaBase.setupJava()).rejects.toThrow(
+      `No matching version found for SemVer '${input.version}'`
+    );
+    expect(spyTcFindAllVersions).toHaveBeenCalled();
+    expect(spyCoreAddPath).not.toHaveBeenCalled();
+    expect(spyCoreExportVariable).not.toHaveBeenCalled();
+    expect(spyCoreSetOutput).not.toHaveBeenCalled();
+  });
+
+  it('should not set JAVA_HOME and PATH when setDefault is false', async () => {
+    mockJavaBase = new EmptyJavaBase({
+      version: '11',
+      architecture: 'x86',
+      packageType: 'jdk',
+      checkLatest: false,
+      setDefault: false
+    });
+    await expect(mockJavaBase.setupJava()).resolves.toEqual({
+      version: installedJavaVersion,
+      path: javaPath
+    });
+    expect(spyCoreExportVariable).not.toHaveBeenCalledWith(
+      'JAVA_HOME',
+      expect.anything()
+    );
+    expect(spyCoreAddPath).not.toHaveBeenCalled();
+    expect(spyCoreExportVariable).toHaveBeenCalledWith(
+      'JAVA_HOME_11_X86',
+      javaPath
+    );
+    expect(spyCoreSetOutput).toHaveBeenCalledWith(
+      'version',
+      installedJavaVersion
+    );
+    expect(spyCoreSetOutput).toHaveBeenCalledWith('path', javaPath);
+    expect(spyCoreSetOutput).toHaveBeenCalledWith('distribution', 'Empty');
+    expect(spyCoreInfo).toHaveBeenCalledWith(
+      `Installing Java ${installedJavaVersion} (not setting as default)`
+    );
+  });
+
+  it('should set JAVA_HOME and PATH when setDefault is true', async () => {
+    mockJavaBase = new EmptyJavaBase({
+      version: '11',
+      architecture: 'x86',
+      packageType: 'jdk',
+      checkLatest: false,
+      setDefault: true
+    });
+    await expect(mockJavaBase.setupJava()).resolves.toEqual({
+      version: installedJavaVersion,
+      path: javaPath
+    });
+    expect(spyCoreExportVariable).toHaveBeenCalledWith('JAVA_HOME', javaPath);
+    expect(spyCoreAddPath).toHaveBeenCalledWith(path.join(javaPath, 'bin'));
+    expect(spyCoreExportVariable).toHaveBeenCalledWith(
+      'JAVA_HOME_11_X86',
+      javaPath
+    );
+    expect(spyCoreInfo).toHaveBeenCalledWith(
+      `Setting Java ${installedJavaVersion} as the default`
+    );
+  });
+
+  it('should default to setting as default when setDefault is not specified', async () => {
+    mockJavaBase = new EmptyJavaBase({
+      version: '11',
+      architecture: 'x86',
+      packageType: 'jdk',
+      checkLatest: false
+    });
+    await expect(mockJavaBase.setupJava()).resolves.toEqual({
+      version: installedJavaVersion,
+      path: javaPath
+    });
+    expect(spyCoreExportVariable).toHaveBeenCalledWith('JAVA_HOME', javaPath);
+    expect(spyCoreAddPath).toHaveBeenCalledWith(path.join(javaPath, 'bin'));
+    expect(spyCoreInfo).toHaveBeenCalledWith(
+      `Setting Java ${installedJavaVersion} as the default`
+    );
+  });
+
+  it('should download and not set default when setDefault is false', async () => {
+    mockJavaBase = new EmptyJavaBase({
+      version: '11',
+      architecture: 'x64',
+      packageType: 'jdk',
+      checkLatest: false,
+      setDefault: false
+    });
+    await expect(mockJavaBase.setupJava()).resolves.toEqual({
+      version: '11.0.9',
+      path: path.join('toolcache', 'Java_Empty_jdk', '11.0.9', 'x64')
+    });
+    expect(spyCoreExportVariable).not.toHaveBeenCalledWith(
+      'JAVA_HOME',
+      expect.anything()
+    );
+    expect(spyCoreAddPath).not.toHaveBeenCalled();
+    expect(spyCoreExportVariable).toHaveBeenCalledWith(
+      'JAVA_HOME_11_X64',
+      path.join('toolcache', 'Java_Empty_jdk', '11.0.9', 'x64')
+    );
+    expect(spyCoreSetOutput).toHaveBeenCalledWith('version', '11.0.9');
+    expect(spyCoreSetOutput).toHaveBeenCalledWith(
+      'path',
+      path.join('toolcache', 'Java_Empty_jdk', '11.0.9', 'x64')
+    );
+    expect(spyCoreInfo).toHaveBeenCalledWith(
+      'Installing Java 11.0.9 (not setting as default)'
+    );
+  });
+});
+
+describe('downloadAndVerify', () => {
+  const options: JavaInstallerOptions = {
+    version: '21',
+    architecture: 'x64',
+    packageType: 'jdk',
+    checkLatest: false
+  };
+  let temporaryDirectory: string;
+  let archivePath: string;
+
+  beforeEach(async () => {
+    temporaryDirectory = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), 'setup-java-base-')
+    );
+    archivePath = path.join(temporaryDirectory, 'archive');
+    await fs.promises.writeFile(archivePath, 'downloaded archive');
+    (tc.downloadTool as jest.Mock<any>).mockResolvedValue(archivePath);
+  });
+
+  afterEach(async () => {
+    await fs.promises.rm(temporaryDirectory, {recursive: true, force: true});
+    jest.resetAllMocks();
+  });
+
+  it('returns a download after successful verification', async () => {
+    const distribution = new EmptyJavaBase(options);
+    const result = await distribution.downloadRelease({
+      version: '21.0.8',
+      url: 'https://vendor.example/jdk.tar.gz',
+      checksum: {
+        algorithm: 'sha256',
+        value: createHash('sha256').update('downloaded archive').digest('hex')
+      }
+    });
+
+    expect(result).toBe(archivePath);
+    expect(fs.existsSync(archivePath)).toBe(true);
+    expect(core.debug).toHaveBeenCalledWith(
+      'Verified sha256 checksum for Empty version 21.0.8.'
+    );
+  });
+
+  it('removes the download after verification failure', async () => {
+    const distribution = new EmptyJavaBase(options);
+
+    await expect(
+      distribution.downloadRelease({
+        version: '21.0.8',
+        url: 'https://vendor.example/jdk.tar.gz?token=secret',
+        checksum: {algorithm: 'sha256', value: 'a'.repeat(64)}
+      })
+    ).rejects.toThrow('Checksum verification failed for Empty version 21.0.8');
+
+    expect(fs.existsSync(archivePath)).toBe(false);
+  });
+
+  it('preserves the verification error when removing the download fails', async () => {
+    const distribution = new EmptyJavaBase(options);
+    const cleanupError = new Error('cleanup failed');
+    jest.spyOn(fs.promises, 'rm').mockRejectedValueOnce(cleanupError);
+
+    const result = distribution.downloadRelease({
+      version: '21.0.8',
+      url: 'https://vendor.example/jdk.tar.gz',
+      checksum: {algorithm: 'sha256', value: 'a'.repeat(64)}
+    });
+
+    await expect(result).rejects.toMatchObject({
+      message: expect.stringContaining(
+        'Failed to remove the downloaded archive after verification failure: cleanup failed'
+      ),
+      cause: expect.objectContaining({
+        message: expect.stringContaining(
+          'Checksum verification failed for Empty version 21.0.8'
+        )
+      })
+    });
+  });
+
+  it('logs when authoritative checksum metadata is unavailable', async () => {
+    const distribution = new EmptyJavaBase(options);
+
+    await expect(
+      distribution.downloadRelease({
+        version: '21.0.8',
+        url: 'https://vendor.example/jdk.tar.gz'
+      })
+    ).resolves.toBe(archivePath);
+
+    expect(core.debug).toHaveBeenCalledWith(
+      'No authoritative checksum is available for Empty version 21.0.8; skipping checksum verification.'
+    );
+  });
+
+  it.each([undefined, '', '   '])(
+    'skips verification when the vendor digest is %p',
+    async value => {
+      const distribution = new EmptyJavaBase(options);
+
+      await expect(
+        distribution.downloadRelease({
+          version: '21.0.8',
+          url: 'https://vendor.example/jdk.tar.gz',
+          checksum: {
+            algorithm: 'sha256',
+            value
+          } as JavaDownloadRelease['checksum']
+        })
+      ).resolves.toBe(archivePath);
+
+      expect(core.debug).toHaveBeenCalledWith(
+        'No authoritative checksum is available for Empty version 21.0.8; skipping checksum verification.'
       );
-      expect(spyTcFindAllVersions).toHaveBeenCalled();
-      expect(spyCoreAddPath).not.toHaveBeenCalled();
-      expect(spyCoreExportVariable).not.toHaveBeenCalled();
-      expect(spyCoreSetOutput).not.toHaveBeenCalled();
     }
   );
+});
+
+describe('fetchChecksum', () => {
+  const options: JavaInstallerOptions = {
+    version: '21',
+    architecture: 'x64',
+    packageType: 'jdk',
+    checkLatest: false
+  };
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  function mockGet(statusCode: number, body: string) {
+    return jest.spyOn(HttpClient.prototype, 'get').mockResolvedValue({
+      message: {statusCode},
+      readBody: async () => body
+    } as any);
+  }
+
+  it('parses a bare hex digest', async () => {
+    const digest = 'a'.repeat(64);
+    const spy = mockGet(200, digest);
+    const distribution = new EmptyJavaBase(options);
+
+    const checksum = await distribution.fetchChecksumForTest(
+      'https://vendor.example/jdk.tar.gz.sha256',
+      'sha256'
+    );
+
+    expect(spy).toHaveBeenCalledWith(
+      'https://vendor.example/jdk.tar.gz.sha256'
+    );
+    expect(checksum).toEqual({
+      algorithm: 'sha256',
+      value: digest,
+      source: 'https://vendor.example/jdk.tar.gz.sha256'
+    });
+  });
+
+  it('parses only the first token of a GNU-style checksum file', async () => {
+    const digest = 'b'.repeat(128);
+    mockGet(200, `${digest}  jbrsdk-21.0.3-linux-x64-b465.3.tar.gz\n`);
+    const distribution = new EmptyJavaBase(options);
+
+    const checksum = await distribution.fetchChecksumForTest(
+      'https://vendor.example/jdk.tar.gz.checksum',
+      'sha512'
+    );
+
+    expect(checksum).toEqual({
+      algorithm: 'sha512',
+      value: digest,
+      source: 'https://vendor.example/jdk.tar.gz.checksum'
+    });
+  });
+
+  it('trims surrounding whitespace and newlines', async () => {
+    const digest = 'c'.repeat(64);
+    mockGet(200, `\n  ${digest}  \n`);
+    const distribution = new EmptyJavaBase(options);
+
+    const checksum = await distribution.fetchChecksumForTest(
+      'https://vendor.example/jdk.tar.gz.sha256',
+      'sha256'
+    );
+
+    expect(checksum.value).toBe(digest);
+  });
+
+  it('skips verification when the sibling checksum is not published', async () => {
+    mockGet(404, 'Not Found');
+    const distribution = new EmptyJavaBase(options);
+
+    await expect(
+      distribution.fetchChecksumForTest(
+        'https://vendor.example/jdk.tar.gz.sha256',
+        'sha256'
+      )
+    ).resolves.toBeUndefined();
+    expect(core.debug).toHaveBeenCalledWith(
+      'No authoritative sha256 checksum is available for Empty from https://vendor.example/jdk.tar.gz.sha256; skipping checksum verification.'
+    );
+  });
+
+  it('surfaces unexpected HTTP failures without query parameters', async () => {
+    mockGet(500, 'Server Error');
+    const distribution = new EmptyJavaBase(options);
+
+    await expect(
+      distribution.fetchChecksumForTest(
+        'https://vendor.example/jdk.tar.gz.sha256?token=secret',
+        'sha256'
+      )
+    ).rejects.toThrow(
+      'Failed to fetch the authoritative sha256 checksum for Empty from https://vendor.example/jdk.tar.gz.sha256 (HTTP 500).'
+    );
+  });
+
+  it('rejects an empty successful checksum response', async () => {
+    mockGet(200, '  \n');
+    const distribution = new EmptyJavaBase(options);
+
+    await expect(
+      distribution.fetchChecksumForTest(
+        'https://vendor.example/jdk.tar.gz.sha256',
+        'sha256'
+      )
+    ).rejects.toThrow(
+      'Received an empty authoritative sha256 checksum for Empty from https://vendor.example/jdk.tar.gz.sha256.'
+    );
+  });
+
+  describe('with a list of candidate algorithms', () => {
+    it('infers sha512 when the digest is 128 hex characters', async () => {
+      const digest = 'd'.repeat(128);
+      mockGet(200, `${digest}  jbrsdk.tar.gz\n`);
+      const distribution = new EmptyJavaBase(options);
+
+      const checksum = await distribution.fetchChecksumForTest(
+        'https://vendor.example/jbrsdk.tar.gz.checksum',
+        ['sha512', 'sha256']
+      );
+
+      expect(checksum).toEqual({
+        algorithm: 'sha512',
+        value: digest,
+        source: 'https://vendor.example/jbrsdk.tar.gz.checksum'
+      });
+    });
+
+    it('infers sha256 when the digest is 64 hex characters, even though sha512 was preferred', async () => {
+      // Reproduces older JetBrains JBR builds (e.g. JBR 11), which publish a
+      // SHA-256 digest at the generic `.checksum` sibling instead of SHA-512.
+      const digest = 'e'.repeat(64);
+      mockGet(200, `${digest}  jbrsdk_nomod-11_0_16-osx-x64-b2043.64.tar.gz\n`);
+      const distribution = new EmptyJavaBase(options);
+
+      const checksum = await distribution.fetchChecksumForTest(
+        'https://vendor.example/jbrsdk_nomod-11_0_16-osx-x64-b2043.64.tar.gz.checksum',
+        ['sha512', 'sha256']
+      );
+
+      expect(checksum).toEqual({
+        algorithm: 'sha256',
+        value: digest,
+        source:
+          'https://vendor.example/jbrsdk_nomod-11_0_16-osx-x64-b2043.64.tar.gz.checksum'
+      });
+    });
+
+    it('falls back to the first candidate algorithm when the digest length matches none of them', async () => {
+      const digest = 'f'.repeat(40); // e.g. sha1, not supported
+      mockGet(200, `${digest}  jbrsdk.tar.gz\n`);
+      const distribution = new EmptyJavaBase(options);
+
+      const checksum = await distribution.fetchChecksumForTest(
+        'https://vendor.example/jbrsdk.tar.gz.checksum',
+        ['sha512', 'sha256']
+      );
+
+      // No candidate algorithm matches, so the first-listed one is kept;
+      // downstream verification will reject it as malformed.
+      expect(checksum.algorithm).toBe('sha512');
+      expect(checksum.value).toBe(digest);
+    });
+
+    it('reports the checksum as unavailable using a combined algorithm label on 404', async () => {
+      mockGet(404, 'Not Found');
+      const distribution = new EmptyJavaBase(options);
+
+      await expect(
+        distribution.fetchChecksumForTest(
+          'https://vendor.example/jbrsdk.tar.gz.checksum',
+          ['sha512', 'sha256']
+        )
+      ).resolves.toBeUndefined();
+      expect(core.debug).toHaveBeenCalledWith(
+        'No authoritative sha512 or sha256 checksum is available for Empty from https://vendor.example/jbrsdk.tar.gz.checksum; skipping checksum verification.'
+      );
+    });
+  });
 });
 
 describe('normalizeVersion', () => {
   const DummyJavaBase = JavaBase as any;
 
   it.each([
-    ['11', {version: '11', stable: true}],
-    ['11.0', {version: '11.0', stable: true}],
-    ['11.0.10', {version: '11.0.10', stable: true}],
-    ['11-ea', {version: '11', stable: false}],
-    ['11.0.2-ea', {version: '11.0.2', stable: false}]
+    ['11', {version: '11', stable: true, latest: false}],
+    ['11.0', {version: '11.0', stable: true, latest: false}],
+    ['11.0.10', {version: '11.0.10', stable: true, latest: false}],
+    ['11-ea', {version: '11', stable: false, latest: false}],
+    ['11.0.2-ea', {version: '11.0.2', stable: false, latest: false}],
+    ['18.0.1.1', {version: '18.0.1+1', stable: true, latest: false}],
+    ['11.0.9.1', {version: '11.0.9+1', stable: true, latest: false}],
+    ['12.0.2.1.0', {version: '12.0.2+1.0', stable: true, latest: false}],
+    ['18.0.1.1-ea', {version: '18.0.1+1', stable: false, latest: false}],
+    ['latest', {version: 'x', stable: true, latest: true}],
+    ['LATEST', {version: 'x', stable: true, latest: true}],
+    ['  Latest  ', {version: 'x', stable: true, latest: true}]
   ])('normalizeVersion from %s to %s', (input, expected) => {
     expect(DummyJavaBase.prototype.normalizeVersion.call(null, input)).toEqual(
       expected
@@ -567,6 +1160,108 @@ describe('normalizeVersion', () => {
     ).toThrow(
       `The string '${version}' is not valid SemVer notation for a Java version. Please check README file for code snippets and more detailed information`
     );
+  });
+
+  it.each(['latest-ea', 'latest.1', 'LATEST-EA', '  latest-ea  '])(
+    'normalizeVersion should throw a targeted error for latest combined with a qualifier (%s)',
+    version => {
+      expect(
+        DummyJavaBase.prototype.normalizeVersion.bind(null, version)
+      ).toThrow(
+        `The 'latest' alias resolves stable (GA) releases only and cannot be combined with '-ea' or other qualifiers (received '${version}'). Use 'latest' on its own, or specify a concrete version.`
+      );
+    }
+  );
+});
+
+describe('createVersionNotFoundError', () => {
+  it('should include all required fields in error message without available versions', () => {
+    const mockJavaBase = new EmptyJavaBase({
+      version: '17.0.5',
+      architecture: 'x64',
+      packageType: 'jdk',
+      checkLatest: false
+    });
+
+    const error = (mockJavaBase as any).createVersionNotFoundError('17.0.5');
+
+    expect(error.message).toContain(
+      "No matching version found for SemVer '17.0.5'"
+    );
+    expect(error.message).toContain('Distribution: Empty');
+    expect(error.message).toContain('Package type: jdk');
+    expect(error.message).toContain('Architecture: x64');
+  });
+
+  it('should include available versions when provided', () => {
+    const mockJavaBase = new EmptyJavaBase({
+      version: '17.0.5',
+      architecture: 'x64',
+      packageType: 'jdk',
+      checkLatest: false
+    });
+
+    const availableVersions = ['11.0.1', '11.0.2', '17.0.1', '17.0.2'];
+    const error = (mockJavaBase as any).createVersionNotFoundError(
+      '17.0.5',
+      availableVersions
+    );
+
+    expect(error.message).toContain(
+      "No matching version found for SemVer '17.0.5'"
+    );
+    expect(error.message).toContain('Distribution: Empty');
+    expect(error.message).toContain('Package type: jdk');
+    expect(error.message).toContain('Architecture: x64');
+    expect(error.message).toContain(
+      'Available versions: 11.0.1, 11.0.2, 17.0.1, 17.0.2'
+    );
+  });
+
+  it('should truncate available versions when there are many', () => {
+    const mockJavaBase = new EmptyJavaBase({
+      version: '17.0.5',
+      architecture: 'x64',
+      packageType: 'jdk',
+      checkLatest: false
+    });
+
+    // Create 60 versions to test truncation
+    const availableVersions = Array.from({length: 60}, (_, i) => `11.0.${i}`);
+    const error = (mockJavaBase as any).createVersionNotFoundError(
+      '17.0.5',
+      availableVersions
+    );
+
+    expect(error.message).toContain('Available versions:');
+    expect(error.message).toContain('...');
+    expect(error.message).toContain('(showing first 50 of 60 versions');
+  });
+
+  it('should include additional context when provided', () => {
+    const mockJavaBase = new EmptyJavaBase({
+      version: '17.0.5',
+      architecture: 'x64',
+      packageType: 'jdk',
+      checkLatest: false
+    });
+
+    const availableVersions = ['11.0.1', '11.0.2'];
+    const additionalContext = 'Platform: linux';
+    const error = (mockJavaBase as any).createVersionNotFoundError(
+      '17.0.5',
+      availableVersions,
+      additionalContext
+    );
+
+    expect(error.message).toContain(
+      "No matching version found for SemVer '17.0.5'"
+    );
+    expect(error.message).toContain('Distribution: Empty');
+    expect(error.message).toContain('Package type: jdk');
+    expect(error.message).toContain('Architecture: x64');
+    expect(error.message).toContain('Platform: linux');
+    expect(error.message).toContain('Available versions: 11.0.1, 11.0.2');
   });
 });
 

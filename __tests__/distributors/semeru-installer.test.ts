@@ -1,12 +1,53 @@
+import {
+  jest,
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  beforeAll,
+  afterAll
+} from '@jest/globals';
+import type {JavaInstallerOptions} from '../../src/distributions/base-models.js';
 import {HttpClient} from '@actions/http-client';
 
-import {JavaInstallerOptions} from '../../src/distributions/base-models';
-import {SemeruDistribution} from '../../src/distributions/semeru/installer';
+import manifestData from '../data/semeru.json' with {type: 'json'};
 
-import manifestData from '../data/semeru.json';
+// Mock @actions/core before importing source modules that depend on it
+jest.unstable_mockModule('@actions/core', () => ({
+  info: jest.fn(),
+  warning: jest.fn(),
+  debug: jest.fn(),
+  error: jest.fn(),
+  notice: jest.fn(),
+  setFailed: jest.fn(),
+  setOutput: jest.fn(),
+  getInput: jest.fn(),
+  getBooleanInput: jest.fn(),
+  getMultilineInput: jest.fn(),
+  addPath: jest.fn(),
+  exportVariable: jest.fn(),
+  saveState: jest.fn(),
+  getState: jest.fn(),
+  setSecret: jest.fn(),
+  isDebug: jest.fn(() => false),
+  startGroup: jest.fn(),
+  endGroup: jest.fn(),
+  group: jest.fn((_name: string, fn: () => Promise<unknown>) => fn()),
+  toPlatformPath: jest.fn((p: string) => p),
+  toWin32Path: jest.fn((p: string) => p),
+  toPosixPath: jest.fn((p: string) => p)
+}));
+
+// Dynamic imports after mocking
+const core = await import('@actions/core');
+const {SemeruDistribution} =
+  await import('../../src/distributions/semeru/installer.js');
 
 describe('getAvailableVersions', () => {
-  let spyHttpClient: jest.SpyInstance;
+  let spyHttpClient: any;
+  let spyCoreError: any;
+  let spyCoreWarning: any;
 
   beforeEach(() => {
     spyHttpClient = jest.spyOn(HttpClient.prototype, 'getJson');
@@ -15,6 +56,11 @@ describe('getAvailableVersions', () => {
       headers: {},
       result: []
     });
+    // Mock core.error to suppress error logs
+    spyCoreError = core.error as jest.Mock;
+    spyCoreError.mockImplementation(() => {});
+    spyCoreWarning = core.warning as jest.Mock;
+    spyCoreWarning.mockImplementation(() => {});
   });
 
   afterEach(() => {
@@ -77,22 +123,19 @@ describe('getAvailableVersions', () => {
   );
 
   it('load available versions', async () => {
+    const nextPageUrl =
+      'https://api.adoptopenjdk.net/v3/assets/version/%5B1.0,100.0%5D?page=1&page_size=20';
     spyHttpClient = jest.spyOn(HttpClient.prototype, 'getJson');
     spyHttpClient
       .mockReturnValueOnce({
         statusCode: 200,
-        headers: {},
+        headers: {link: `<${nextPageUrl}>; rel="next"`},
         result: manifestData as any
       })
       .mockReturnValueOnce({
         statusCode: 200,
         headers: {},
         result: manifestData as any
-      })
-      .mockReturnValueOnce({
-        statusCode: 200,
-        headers: {},
-        result: []
       });
 
     const distribution = new SemeruDistribution({
@@ -104,6 +147,31 @@ describe('getAvailableVersions', () => {
     const availableVersions = await distribution['getAvailableVersions']();
     expect(availableVersions).not.toBeNull();
     expect(availableVersions.length).toBe(manifestData.length * 2);
+    expect(spyHttpClient).toHaveBeenNthCalledWith(2, nextPageUrl);
+  });
+
+  it('stops pagination after 1000 pages as a safeguard', async () => {
+    const nextPageUrl =
+      'https://api.adoptopenjdk.net/v3/assets/version/%5B1.0,100.0%5D?page=2&page_size=20';
+    spyHttpClient.mockReturnValue({
+      statusCode: 200,
+      headers: {link: `<${nextPageUrl}>; rel="next"`},
+      result: [{version_data: {semver: '17.0.1'}, binaries: []}] as any
+    });
+
+    const distribution = new SemeruDistribution({
+      version: '8',
+      architecture: 'x64',
+      packageType: 'jdk',
+      checkLatest: false
+    });
+
+    await distribution['getAvailableVersions']();
+
+    expect(spyHttpClient).toHaveBeenCalledTimes(1000);
+    expect(spyCoreWarning).toHaveBeenCalledWith(
+      expect.stringContaining('Reached pagination safeguard limit (1000 pages)')
+    );
   });
 
   it.each([
@@ -140,6 +208,14 @@ describe('findPackageForDownload', () => {
     distribution['getAvailableVersions'] = async () => manifestData as any;
     const resolvedVersion = await distribution['findPackageForDownload'](input);
     expect(resolvedVersion.version).toBe(expected);
+    const vendorPackage = (manifestData as any[]).find(
+      item => item.version_data.semver === expected
+    ).binaries[0].package;
+    expect(resolvedVersion.checksum).toEqual({
+      algorithm: 'sha256',
+      value: vendorPackage.checksum,
+      source: vendorPackage.checksum_link
+    });
   });
 
   it('version is found but binaries list is empty', async () => {
@@ -152,7 +228,7 @@ describe('findPackageForDownload', () => {
     distribution['getAvailableVersions'] = async () => manifestData as any;
     await expect(
       distribution['findPackageForDownload']('9.0.8')
-    ).rejects.toThrow(/Could not find satisfied version for SemVer */);
+    ).rejects.toThrow(/No matching version found for SemVer */);
   });
 
   it('version is not found', async () => {
@@ -164,7 +240,7 @@ describe('findPackageForDownload', () => {
     });
     distribution['getAvailableVersions'] = async () => manifestData as any;
     await expect(distribution['findPackageForDownload']('7.x')).rejects.toThrow(
-      /Could not find satisfied version for SemVer */
+      /No matching version found for SemVer */
     );
   });
 
@@ -177,7 +253,7 @@ describe('findPackageForDownload', () => {
     });
     distribution['getAvailableVersions'] = async () => [];
     await expect(distribution['findPackageForDownload']('8')).rejects.toThrow(
-      /Could not find satisfied version for SemVer */
+      /No matching version found for SemVer */
     );
   });
 

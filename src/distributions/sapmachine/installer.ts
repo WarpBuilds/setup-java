@@ -10,14 +10,14 @@ import {
   getDownloadArchiveExtension,
   isVersionSatisfies,
   renameWinArchive
-} from '../../util';
-import {JavaBase} from '../base-installer';
+} from '../../util.js';
+import {JavaBase} from '../base-installer.js';
 import {
   JavaDownloadRelease,
   JavaInstallerOptions,
   JavaInstallerResults
-} from '../base-models';
-import {ISapMachineAllVersions, ISapMachineVersions} from './models';
+} from '../base-models.js';
+import {ISapMachineAllVersions, ISapMachineVersions} from './models.js';
 
 export class SapMachineDistribution extends JavaBase {
   constructor(installerOptions: JavaInstallerOptions) {
@@ -49,13 +49,21 @@ export class SapMachineDistribution extends JavaBase {
       });
 
     if (!matchedVersions.length) {
-      throw new Error(
-        `Couldn't find any satisfied version for the specified java-version: "${version}" and architecture: "${this.architecture}".`
+      const availableVersionStrings = availableVersions.map(
+        item => item.version
       );
+      throw this.createVersionNotFoundError(version, availableVersionStrings);
     }
 
     const resolvedVersion = matchedVersions[0];
-    return resolvedVersion;
+    const checksumUrl = resolvedVersion.url.replace(
+      /\.(?:tar\.gz|zip)$/,
+      '.sha256.txt'
+    );
+    return {
+      ...resolvedVersion,
+      checksum: await this.fetchChecksum(checksumUrl, 'sha256')
+    };
   }
 
   private async getAvailableVersions(): Promise<ISapMachineVersions[]> {
@@ -103,7 +111,7 @@ export class SapMachineDistribution extends JavaBase {
     core.info(
       `Downloading Java ${javaRelease.version} (${this.distribution}) from ${javaRelease.url} ...`
     );
-    let javaArchivePath = await tc.downloadTool(javaRelease.url);
+    let javaArchivePath = await this.downloadAndVerify(javaRelease);
 
     core.info(`Extracting Java archive...`);
     const extension = getDownloadArchiveExtension();
